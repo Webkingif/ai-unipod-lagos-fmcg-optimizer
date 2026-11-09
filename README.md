@@ -368,8 +368,8 @@ You are free to use, modify, and distribute this code for commercial or non-comm
 For questions, feature requests, or collaboration:
 
 - Open an issue on GitHub
-- Reach out at `your.email@example.com`
-- Connect on LinkedIn
+- Reach out at `idowuoluwafemiayomide@gmail.com`
+- Connect on ![LinkedIn](https://www.linkedin.com/in/oluwafemi-idowu-ayomide)
 
 ---
 
