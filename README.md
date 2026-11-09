@@ -128,7 +128,7 @@ No manual setup, no `.env` file, no seed data required.
 ## 🗂️ Project Structure
 
 ```text
-lagos-fmcg-optimizer/
+ai-unipod-lagos-fmcg-optimizer/
 ├── app.py                          # Main Streamlit application (single-file)
 ├── requirements.txt                # Pinned dependencies
 ├── README.md                       # This file
