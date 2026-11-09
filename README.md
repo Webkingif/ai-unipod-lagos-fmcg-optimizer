@@ -85,7 +85,7 @@ The app is designed for two audiences: **operations planners** who need to see a
 ## 🚀 Installation
 
 ### Prerequisites
-- Python **3.10 or newer**
+- Python **3.10 or newer (python 3.14 was used for this project)**
 - Internet access to `router.project-osrm.org` for road distances and street geometry
 - A writable filesystem (for auto-generated model and routing cache)
 
@@ -93,8 +93,8 @@ The app is designed for two audiences: **operations planners** who need to see a
 
 ```bash
 # 1. Clone the repository
-git clone [https://github.com/](https://github.com/)<your-username>/lagos-fmcg-optimizer.git
-cd lagos-fmcg-optimizer
+git clone https://github.com/Webkingif/ai-unipod-lagos-fmcg-optimizer.git
+cd ai-unipod-lagos-fmcg-optimizer
 
 # 2. (Recommended) Create a virtual environment
 python -m venv venv
