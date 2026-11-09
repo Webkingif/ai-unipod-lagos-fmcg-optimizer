@@ -369,7 +369,7 @@ For questions, feature requests, or collaboration:
 
 - Open an issue on GitHub
 - Reach out at `idowuoluwafemiayomide@gmail.com`
-- Connect on ![LinkedIn](https://www.linkedin.com/in/oluwafemi-idowu-ayomide)
+- Connect on https://www.linkedin.com/in/oluwafemi-idowu-ayomide
 
 ---
 
