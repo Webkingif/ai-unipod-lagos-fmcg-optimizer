@@ -54,8 +54,6 @@ The app is designed for two audiences: **operations planners** who need to see a
 
 ## 📸 Screenshots
 
-> **Note to contributors:** replace the placeholders below with actual screenshots and GIFs. Recommended resolution: 1440×900 for static shots, ≤5 MB for GIFs. Store all images under `assets/` in the repo root.
-
 ### Overview & Fleet Routes
 ![Overview tab — VRP solver, dispatch table, and interactive map](assets/screenshot-overview.png)
 ![Overview tab — VRP solver, dispatch table, and interactive map](assets/screenshot-overview2.png)
@@ -216,30 +214,6 @@ The VRP solver uses real road distances, not haversine. This matters enormously 
 | `routing_matrices.pkl` on disk | Cross-session | Fingerprint mismatch → bypassed on next solve |
 
 The in-memory cache handles rapid re-solves within a session. The disk cache handles cold starts. Both are safe to delete at any time.
-
----
-
-## ⚙️ Configuration
-
-All simulation and cost parameters are exposed in the Operational Simulation tab under **"Simulation & Cost Parameters"**:
-
-| Parameter | Default | Meaning |
-|---|---|---|
-| Shift length | 480 min | Working-day SLA window |
-| Avg driving speed | 18 km/h | Lagos inner-city average |
-| Peak-hour multiplier | 2.4× | Traffic factor cap during peak hours |
-| Service mean / std | 7 min / 2 min | Normal distribution for unloading time |
-| Breakdown base prob | 0.02 | Flat component of breakdown risk per stop |
-| Breakdown per-km prob | 0.005 | Additional breakdown risk per cumulative km driven |
-| Rejection base prob | 0.05 | Flat component of rejection risk per stop |
-| Rejection demand weight | 0.03 | Risk scaling per carton/20 order size |
-| Driver cost | ₦2,500 / hr | Base wage |
-| Overtime multiplier | 1.5× | Applied beyond shift length |
-| Fuel cost | ₦120 / km | Per-km variable cost |
-| Breakdown incident cost | ₦8,000 | Fixed cost per breakdown |
-| Rejection handling cost | ₦1,500 | Fixed cost per rejected stop |
-
-> ⚠️ **Note:** All disruption and cost parameters are illustrative assumptions. Replace with historical Lagos data for production use.
 
 ---
 
