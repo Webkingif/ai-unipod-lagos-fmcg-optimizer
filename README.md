@@ -58,6 +58,7 @@ The app is designed for two audiences: **operations planners** who need to see a
 
 ### Overview & Fleet Routes
 ![Overview tab — VRP solver, dispatch table, and interactive map](assets/screenshot-overview.png)
+![Overview tab — VRP solver, dispatch table, and interactive map](assets/screenshot-overview2.png)
 *The Overview tab after a successful solve. The dispatch table shows per-van routes, loads, and estimated road distance. The map shows all merchant nodes with hover coordinates.*
 
 ### Street-Following Van Animation
@@ -78,6 +79,7 @@ The app is designed for two audiences: **operations planners** who need to see a
 
 ### AI Risk Predictor
 ![XGBoost risk predictor interface with sliders and probability score](assets/screenshot-risk.png)
+![XGBoost risk predictor interface with sliders and probability score](assets/screenshot-risk2.png)
 *The XGBoost predictor scoring a route with moderate traffic and off-peak delivery window.*
 
 ---
