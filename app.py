@@ -5,6 +5,7 @@ import pickle
 import os
 import time
 import random
+import hashlib
 import simpy
 import requests
 import plotly.express as px
@@ -20,13 +21,11 @@ st.set_page_config(
 )
 
 # ============================================================
-# AUTO-GENERATE / RETRAIN MODEL
+# AUTO-GENERATE / RETRAIN MODEL (hardened)
 # ============================================================
 def ensure_model_exists(force_retrain=False):
     """Train or retrain the risk model on a realistic multi-feature rule.
-
-    All 5 features now contribute meaningfully to the label so every slider
-    in the AI Risk Predictor tab has an observable effect.
+    Every slider in the AI Risk Predictor now has an observable effect.
     """
     os.makedirs("data/models", exist_ok=True)
     model_path = "data/models/risk_xgb_model.pkl"
@@ -65,23 +64,21 @@ def ensure_model_exists(force_retrain=False):
             pickle.dump(model, f)
 
 
-ensure_model_exists()
+try:
+    ensure_model_exists()
+except Exception as e:
+    st.warning(
+        f"Could not auto-create risk model ({e}). "
+        "The AI Risk Predictor tab will use the heuristic fallback."
+    )
 
 
 # ============================================================
-# CACHED DATA & MODEL LOADERS
+# CACHED MODEL LOADER
 # ============================================================
 @st.cache_resource
 def load_assets():
     assets = {}
-    routing_path = "data/processed/routing_matrices.pkl"
-    if os.path.exists(routing_path):
-        try:
-            with open(routing_path, "rb") as f:
-                assets["routing"] = pickle.load(f)
-        except Exception as e:
-            st.warning(f"Could not load routing matrices: {e}")
-
     model_path = "data/models/risk_xgb_model.pkl"
     if os.path.exists(model_path):
         try:
@@ -89,7 +86,6 @@ def load_assets():
                 assets["model"] = pickle.load(f)
         except Exception as e:
             st.warning(f"Could not load XGBoost model: {e}")
-
     return assets
 
 
@@ -128,20 +124,129 @@ if "road_paths" not in st.session_state:
     st.session_state.road_paths = None
 if "road_paths_error" not in st.session_state:
     st.session_state.road_paths_error = None
+if "_dist_matrix_m" not in st.session_state:
+    st.session_state["_dist_matrix_m"] = None
+if "_vrp_distance_source" not in st.session_state:
+    st.session_state["_vrp_distance_source"] = None
+if "_distance_from_cache" not in st.session_state:
+    st.session_state["_distance_from_cache"] = False
+if "_cache_invalidation_reason" not in st.session_state:
+    st.session_state["_cache_invalidation_reason"] = None
 
 
 # ============================================================
-# OSRM ROAD GEOMETRY HELPERS
+# ROUTING CACHE — fingerprinting helpers
 # ============================================================
-OSRM_BASE = "http://router.project-osrm.org/route/v1/driving"
+ROUTING_CACHE_PATH = "data/processed/routing_matrices.pkl"
+
+
+def _fingerprint_merchants(nodes):
+    """Stable hash of the merchant set in current row order.
+
+    Any add / delete / reorder / coordinate change / demand change
+    produces a different fingerprint, invalidating the on-disk cache.
+    """
+    fp_src = "|".join(
+        f"{r['name']}|{float(r['lat']):.6f}|{float(r['lon']):.6f}"
+        f"|{int(r['demand'])}|{r['type']}"
+        for _, r in nodes.iterrows()
+    )
+    return hashlib.sha256(fp_src.encode("utf-8")).hexdigest()[:16]
+
+
+def _read_routing_cache():
+    """Return the parsed cache dict, or None if missing/corrupt."""
+    if not os.path.exists(ROUTING_CACHE_PATH):
+        return None
+    try:
+        with open(ROUTING_CACHE_PATH, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def _write_routing_cache(dist_int, nodes, source, fingerprint):
+    """Persist the matrix to disk with metadata for validation."""
+    try:
+        os.makedirs("data/processed", exist_ok=True)
+        with open(ROUTING_CACHE_PATH, "wb") as f:
+            pickle.dump({
+                "distance_m": dist_int,
+                "nodes": nodes,
+                "source": source,
+                "fingerprint": fingerprint,
+                "created_at": time.time(),
+            }, f)
+        return None
+    except Exception as e:
+        return str(e)
+
+
+# ============================================================
+# OSRM DISTANCE MATRIX (TABLE SERVICE)
+# ============================================================
+OSRM_TABLE_URL = "http://router.project-osrm.org/table/v1/driving"
+OSRM_ROUTE_BASE = "http://router.project-osrm.org/route/v1/driving"
+
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    R = 6371000.0
+    la1, lo1 = np.radians(lat1), np.radians(lon1)
+    la2, lo2 = np.radians(lat2), np.radians(lon2)
+    h = np.sin((la2 - la1) / 2) ** 2 + np.cos(la1) * np.cos(la2) * np.sin((lo2 - lo1) / 2) ** 2
+    return 2 * R * np.arcsin(np.sqrt(h))
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def fetch_osrm_distance_matrix(lats, lons):
+    """Fetch an N×N road-distance matrix (meters) from OSRM in ONE request.
+
+    Returns (matrix_ndarray, source_str).
+    Unreachable pairs are back-filled with haversine.
+    """
+    n = len(lats)
+    if n < 2:
+        return np.zeros((n, n)), "Trivial"
+    if n > 100:
+        mat = np.zeros((n, n))
+        for i in range(n):
+            for j in range(n):
+                mat[i, j] = _haversine_m(lats[i], lons[i], lats[j], lons[j])
+        return mat, "Haversine fallback (>100 nodes)"
+
+    coords = ";".join(f"{lon},{lat}" for lat, lon in zip(lats, lons))
+    url = f"{OSRM_TABLE_URL}/{coords}?annotations=distance"
+    try:
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+        if data.get("code") != "Ok" or "distances" not in data:
+            raise RuntimeError(data.get("code", "no distances returned"))
+        raw = data["distances"]
+        mat = np.array(
+            [[np.nan if v is None else float(v) for v in row] for row in raw],
+            dtype=float,
+        )
+        nan_mask = np.isnan(mat)
+        if nan_mask.any():
+            for i, j in zip(*np.where(nan_mask)):
+                mat[i, j] = _haversine_m(lats[i], lons[i], lats[j], lons[j])
+        return mat, "OSRM road distance"
+    except Exception:
+        mat = np.zeros((n, n))
+        for i in range(n):
+            for j in range(n):
+                mat[i, j] = _haversine_m(lats[i], lons[i], lats[j], lons[j])
+        return mat, "Haversine fallback"
+
+
+# ============================================================
+# ROAD GEOMETRY (per-leg) FOR ANIMATION
+# ============================================================
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_road_leg(start_lat, start_lon, end_lat, end_lon):
-    """Fetch the driving path between two points from OSRM."""
     try:
         url = (
-            f"{OSRM_BASE}/{start_lon},{start_lat};{end_lon},{end_lat}"
+            f"{OSRM_ROUTE_BASE}/{start_lon},{start_lat};{end_lon},{end_lat}"
             f"?overview=full&geometries=geojson"
         )
         resp = requests.get(url, timeout=8)
@@ -158,7 +263,6 @@ def build_van_paths_with_roads(routes, nodes, depot_pt, progress_cb=None):
     van_paths = []
     road_legs = 0
     fallback_legs = 0
-
     total_legs = sum(len(r) + 1 for r in routes)
     done_legs = 0
 
@@ -204,9 +308,7 @@ def interpolate_along_polyline(polyline, progress):
         h = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
         return 2 * R * np.arcsin(np.sqrt(h))
 
-    seg_lengths = [
-        hav(polyline[i], polyline[i + 1]) for i in range(len(polyline) - 1)
-    ]
+    seg_lengths = [hav(polyline[i], polyline[i + 1]) for i in range(len(polyline) - 1)]
     total = sum(seg_lengths)
     if total == 0:
         return polyline[0]
@@ -220,34 +322,66 @@ def interpolate_along_polyline(polyline, progress):
             lon = polyline[i][1] + (polyline[i + 1][1] - polyline[i][1]) * t
             return (lat, lon)
         acc += seg_len
-
     return polyline[-1]
 
 
 # ============================================================
-# VRP SOLVER (OR-TOOLS)
+# VRP SOLVER (OR-TOOLS) — FINGERPRINTED CACHE
 # ============================================================
-def haversine_km(a, b):
-    R = 6371.0
-    lat1, lon1 = np.radians(a['lat']), np.radians(a['lon'])
-    lat2, lon2 = np.radians(b['lat']), np.radians(b['lon'])
-    dlat, dlon = lat2 - lat1, lon2 - lon1
-    h = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    return 2 * R * np.arcsin(np.sqrt(h))
-
-
 def solve_vrp(merchants_df, fleet_df):
     from ortools.constraint_solver import routing_enums_pb2, pywrapcp
 
     nodes = merchants_df.reset_index(drop=True)
     n = len(nodes)
+    lats = nodes['lat'].astype(float).tolist()
+    lons = nodes['lon'].astype(float).tolist()
 
-    dist = np.zeros((n, n))
-    for i in range(n):
-        for j in range(n):
-            dist[i, j] = haversine_km(nodes.iloc[i], nodes.iloc[j])
-    dist_int = (dist * 1000).astype(int)
+    fingerprint = _fingerprint_merchants(nodes)
+    cached = _read_routing_cache()
 
+    dist_int = None
+    dist_source = None
+    from_cache = False
+    invalidation_reason = None
+
+    # ---- 1. Try the on-disk cache ----
+    if cached is not None:
+        cached_fp = cached.get("fingerprint")
+        cached_mat = cached.get("distance_m")
+        if cached_fp is None:
+            invalidation_reason = "Cache has no fingerprint (legacy file)"
+        elif cached_fp != fingerprint:
+            invalidation_reason = "Merchant set changed since last solve"
+        elif not isinstance(cached_mat, np.ndarray):
+            invalidation_reason = "Cached distance matrix is not a numpy array"
+        elif cached_mat.shape != (n, n):
+            invalidation_reason = (
+                f"Cached matrix shape {cached_mat.shape} != ({n}, {n})"
+            )
+        else:
+            dist_int = cached_mat.astype(int)
+            dist_source = cached.get("source", "unknown") + " (cache)"
+            from_cache = True
+
+    # ---- 2. Cache miss — fetch fresh ----
+    if dist_int is None:
+        dist_m, dist_source_raw = fetch_osrm_distance_matrix(
+            tuple(lats), tuple(lons)
+        )
+        dist_int = dist_m.astype(int)
+        dist_source = dist_source_raw
+
+        write_err = _write_routing_cache(dist_int, nodes, dist_source_raw, fingerprint)
+        if write_err:
+            st.session_state["_pickle_write_error"] = write_err
+
+    # ---- 3. Publish to session state for solver + SimPy + UI ----
+    st.session_state["_dist_matrix_m"] = dist_int
+    st.session_state["_vrp_distance_source"] = dist_source
+    st.session_state["_distance_from_cache"] = from_cache
+    st.session_state["_cache_invalidation_reason"] = invalidation_reason
+
+    # ---- 4. Standard OR-Tools CVRP ----
     active = fleet_df[fleet_df['Status'] == 'Active'].reset_index(drop=True)
     if len(active) == 0:
         return [], nodes, pd.DataFrame()
@@ -273,9 +407,7 @@ def solve_vrp(merchants_df, fleet_df):
 
     demand_idx = routing.RegisterUnaryTransitCallback(demand_cb)
     caps = active['Capacity (Cartons)'].astype(int).tolist()
-    routing.AddDimensionWithVehicleCapacity(
-        demand_idx, 0, caps, True, "Capacity"
-    )
+    routing.AddDimensionWithVehicleCapacity(demand_idx, 0, caps, True, "Capacity")
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = (
@@ -341,6 +473,15 @@ def solve_vrp(merchants_df, fleet_df):
 # HOVER LAYER HELPER
 # ============================================================
 def build_hover_layer(merchants_df, pad=0.02, resolution=60):
+    """Transparent grid layer used to display coordinates anywhere on the map.
+
+    Merchant markers are drawn ABOVE this layer, so they intercept hover
+    first. Empty space falls through to this grid and shows lat/lon.
+
+    The dummy `display_name` and `demand_str` columns exist so that a single
+    shared tooltip HTML can reference the same field names on every pickable
+    layer (otherwise pydeck renders `{undefined}` for missing fields).
+    """
     lats = merchants_df['lat'].astype(float)
     lons = merchants_df['lon'].astype(float)
     lat_min, lat_max = lats.min() - pad, lats.max() + pad
@@ -356,6 +497,9 @@ def build_hover_layer(merchants_df, pad=0.02, resolution=60):
     })
     coord_grid["lat_str"] = coord_grid["lat"].map(lambda v: f"{v:.5f}")
     coord_grid["lon_str"] = coord_grid["lon"].map(lambda v: f"{v:.5f}")
+    # Dummy fields so the shared tooltip resolves cleanly.
+    coord_grid["display_name"] = ""
+    coord_grid["demand_str"] = ""
 
     return pdk.Layer(
         "ScatterplotLayer",
@@ -366,6 +510,16 @@ def build_hover_layer(merchants_df, pad=0.02, resolution=60):
         pickable=True,
         auto_highlight=False,
     )
+
+
+def _augment_for_tooltip(df):
+    """Add the string fields used by the shared tooltip HTML."""
+    out = df.copy()
+    out["lat_str"] = out["lat"].map(lambda v: f"{float(v):.5f}")
+    out["lon_str"] = out["lon"].map(lambda v: f"{float(v):.5f}")
+    out["demand_str"] = out["demand"].astype(int).astype(str)
+    out["display_name"] = out["name"].astype(str)
+    return out
 
 
 # ============================================================
@@ -392,14 +546,6 @@ class SimConfig:
     rejection_cost: float = 1500.0
 
 
-def _haversine_km_coords(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    la1, lo1 = np.radians(lat1), np.radians(lon1)
-    la2, lo2 = np.radians(lat2), np.radians(lon2)
-    h = np.sin((la2 - la1) / 2) ** 2 + np.cos(la1) * np.cos(la2) * np.sin((lo2 - lo1) / 2) ** 2
-    return 2 * R * np.arcsin(np.sqrt(h))
-
-
 def _assign_round_robin(nodes, fleet_df):
     active = fleet_df[fleet_df['Status'] == 'Active'].reset_index(drop=True)
     merchant_indices = nodes.index[nodes['type'] == 'Merchant'].tolist()
@@ -409,7 +555,8 @@ def _assign_round_robin(nodes, fleet_df):
     return routes
 
 
-def simulate_routes(routes, nodes, fleet_df, cfg: SimConfig, seed: int = None):
+def simulate_routes(routes, nodes, fleet_df, cfg: SimConfig, seed: int = None,
+                    dist_matrix_m=None):
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
@@ -417,7 +564,7 @@ def simulate_routes(routes, nodes, fleet_df, cfg: SimConfig, seed: int = None):
     env = simpy.Environment()
     active = fleet_df[fleet_df['Status'] == 'Active'].reset_index(drop=True)
     depot_rows = nodes[nodes['type'] == 'Depot']
-    depot = depot_rows.iloc[0] if not depot_rows.empty else nodes.iloc[0]
+    depot_idx = int(depot_rows.index[0]) if not depot_rows.empty else 0
 
     gantt_events = []
     per_van_acc = {}
@@ -450,13 +597,22 @@ def simulate_routes(routes, nodes, fleet_df, cfg: SimConfig, seed: int = None):
         per_van_acc[van_id] = acc
 
         stop_indices = [int(i) for i in route]
-        ordered_nodes = [depot] + [nodes.iloc[i] for i in stop_indices] + [depot]
+        ordered_indices = [depot_idx] + stop_indices + [depot_idx]
 
-        for leg_i in range(len(ordered_nodes) - 1):
-            frm = ordered_nodes[leg_i]
-            to = ordered_nodes[leg_i + 1]
+        for leg_i in range(len(ordered_indices) - 1):
+            from_idx = ordered_indices[leg_i]
+            to_idx = ordered_indices[leg_i + 1]
+            to = nodes.iloc[to_idx]
 
-            km = _haversine_km_coords(frm['lat'], frm['lon'], to['lat'], to['lon'])
+            if dist_matrix_m is not None:
+                km = float(dist_matrix_m[from_idx, to_idx]) / 1000.0
+            else:
+                frm = nodes.iloc[from_idx]
+                km = _haversine_m(
+                    float(frm['lat']), float(frm['lon']),
+                    float(to['lat']), float(to['lon']),
+                ) / 1000.0
+
             base_min = (km / max(cfg.avg_speed_kmh, 1.0)) * 60.0
             traffic = float(np.random.gamma(2.0, 0.8))
             traffic = min(traffic, cfg.peak_multiplier)
@@ -555,10 +711,12 @@ def simulate_routes(routes, nodes, fleet_df, cfg: SimConfig, seed: int = None):
     return {"gantt_df": gantt_df, "per_van": per_van_df, "totals": totals}
 
 
-def monte_carlo_simulation(routes, nodes, fleet_df, cfg: SimConfig, n_runs: int = 50):
+def monte_carlo_simulation(routes, nodes, fleet_df, cfg: SimConfig,
+                           n_runs: int = 50, dist_matrix_m=None):
     results = []
     for i in range(n_runs):
-        r = simulate_routes(routes, nodes, fleet_df, cfg, seed=1000 + i)
+        r = simulate_routes(routes, nodes, fleet_df, cfg, seed=1000 + i,
+                            dist_matrix_m=dist_matrix_m)
         results.append(r["totals"])
 
     df = pd.DataFrame(results)
@@ -578,7 +736,7 @@ def monte_carlo_simulation(routes, nodes, fleet_df, cfg: SimConfig, n_runs: int 
 # SIDEBAR
 # ============================================================
 st.sidebar.title("🚚 Control Panel")
-st.sidebar.markdown("**Yaba / Ikeja FMCG Corridor**")
+st.sidebar.markdown("**Lagos FMCG Corridor**")
 app_mode = st.sidebar.radio(
     "Navigation",
     ["Overview & Fleet Routes", "Operational Simulation (SimPy)", "AI Risk Predictor (XGBoost)"]
@@ -610,7 +768,7 @@ if app_mode == "Overview & Fleet Routes":
                     )
                     st.session_state.solver_run = False
                     st.session_state.road_paths = None
-                    st.success(f"Added {new_name}!")
+                    st.success(f"Added {new_name}! Cache will auto-invalidate on next solve.")
                     st.rerun()
 
         elif crud_action == "Update Merchant":
@@ -645,7 +803,7 @@ if app_mode == "Overview & Fleet Routes":
                         st.session_state.merchants_df.loc[idx, 'demand'] = up_demand
                         st.session_state.solver_run = False
                         st.session_state.road_paths = None
-                        st.success(f"Updated {selected_m}!")
+                        st.success(f"Updated {selected_m}! Cache will auto-invalidate on next solve.")
                         st.rerun()
             else:
                 st.sidebar.info("No merchants available.")
@@ -665,7 +823,7 @@ if app_mode == "Overview & Fleet Routes":
                     ).reset_index(drop=True)
                     st.session_state.solver_run = False
                     st.session_state.road_paths = None
-                    st.success(f"Deleted {del_m}!")
+                    st.success(f"Deleted {del_m}! Cache will auto-invalidate on next solve.")
                     st.rerun()
             else:
                 st.sidebar.info("No merchants available.")
@@ -759,7 +917,7 @@ st.sidebar.info(
 # MAIN VIEW: OVERVIEW & FLEET ROUTES
 # ============================================================
 if app_mode == "Overview & Fleet Routes":
-    st.title("🗺️ Yaba Corridor Fleet Routing & Network")
+    st.title("🗺️ Lagos Corridor Fleet Routing & Network")
     st.markdown(
         "Visualizing optimized Capacitated Vehicle Routing Problem (CVRP) "
         "schedules for the Lagos distribution hub."
@@ -787,12 +945,50 @@ if app_mode == "Overview & Fleet Routes":
 
     st.markdown("### ⚙️ VRP Optimization Engine")
     st.caption(
-        "Running the solver will also fetch **street-level road geometry** from OSRM "
-        "for every leg of every van's route. This is cached so the animation replays instantly."
+        "The solver uses an **N×N road-distance matrix** cached on disk at "
+        "`data/processed/routing_matrices.pkl`. A SHA-256 fingerprint of the merchant "
+        "set is stored alongside the matrix — any add / delete / edit invalidates the "
+        "cache automatically, and the next solve fetches fresh OSRM data."
     )
 
+    # ---------- Cache status banner ----------
+    _cached = _read_routing_cache()
+    _current_fp = _fingerprint_merchants(
+        st.session_state.merchants_df.reset_index(drop=True)
+    )
+    if _cached is None:
+        st.info(
+            "ℹ️ **No routing-matrix cache yet.** First solve will query OSRM and "
+            "create `data/processed/routing_matrices.pkl`."
+        )
+    else:
+        _cached_fp = _cached.get("fingerprint")
+        if _cached_fp is None:
+            st.warning(
+                "⚠️ **Legacy cache file** (no fingerprint). It will be bypassed and "
+                "rewritten on the next solve."
+            )
+        elif _cached_fp == _current_fp:
+            _created = _cached.get("created_at")
+            _src = _cached.get("source", "unknown")
+            _ts = (
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(_created))
+                if _created else "unknown"
+            )
+            st.success(
+                f"♻️ **Cache is valid** — fingerprint `{_cached_fp}` matches the "
+                f"current merchant set. Source: **{_src}**, created {_ts}. "
+                f"Next solve will reuse the cached matrix (instant)."
+            )
+        else:
+            st.warning(
+                f"🔄 **Merchant set changed since last solve** — cached fingerprint "
+                f"`{_cached_fp}` ≠ current `{_current_fp}`. Next solve will bypass "
+                f"the cache and query OSRM fresh."
+            )
+
     if st.button("🚀 Run OR-Tools Solver for Current Network"):
-        with st.spinner("Running Google OR-Tools CVRP optimization..."):
+        with st.spinner("Resolving distance matrix + solving CVRP..."):
             try:
                 routes, nodes, summary = solve_vrp(
                     st.session_state.merchants_df, st.session_state.fleet_df
@@ -806,6 +1002,16 @@ if app_mode == "Overview & Fleet Routes":
 
                 if len(routes) > 0:
                     st.success("CVRP Solver executed successfully! Routes re-optimized.")
+                    _src = st.session_state.get("_vrp_distance_source", "unknown")
+                    _from_cache = st.session_state.get("_distance_from_cache", False)
+                    _badge = "♻️ served from cache" if _from_cache else "🌐 fetched fresh from OSRM"
+                    st.caption(f"Distance metric: **{_src}** ({_badge}).")
+                    _reason = st.session_state.get("_cache_invalidation_reason")
+                    if _reason and not _from_cache:
+                        st.caption(f"Cache bypass reason: _{_reason}_")
+                    _werr = st.session_state.get("_pickle_write_error")
+                    if _werr:
+                        st.caption(f"⚠️ Could not write cache file: _{_werr}_")
                 else:
                     st.warning("Solver returned no routes — check that at least one van is Active.")
             except ImportError:
@@ -871,6 +1077,8 @@ if app_mode == "Overview & Fleet Routes":
     st.markdown("### 📊 Fleet Dispatch & Inventory Summary")
     if st.session_state.solver_run and st.session_state.vrp_summary is not None \
             and not st.session_state.vrp_summary.empty:
+        src = st.session_state.get("_vrp_distance_source", "unknown")
+        st.caption(f"Distances below are **{src}**.")
         display_cols = [
             "Van ID", "Driver", "Assigned Stops", "Total Load (Cartons)",
             "Capacity (Cartons)", "Estimated Distance (km)", "Route Sequence"
@@ -888,10 +1096,36 @@ if app_mode == "Overview & Fleet Routes":
     with st.expander("📋 View Current Merchant Node Registry Table"):
         st.dataframe(st.session_state.merchants_df, use_container_width=True)
 
-    st.markdown("### 📍 Yaba Corridor Network Map")
-    st.caption("Hover anywhere on the map to read latitude / longitude.")
+    # ---------- Cache inspector ----------
+    with st.expander("🗄️ Inspect routing matrix cache"):
+        _c = _read_routing_cache()
+        if _c is None:
+            st.info("Cache file does not exist yet.")
+        else:
+            _mat = _c.get("distance_m")
+            st.markdown(
+                f"- **File**: `{ROUTING_CACHE_PATH}`\n"
+                f"- **Fingerprint**: `{_c.get('fingerprint', 'MISSING')}`\n"
+                f"- **Source**: `{_c.get('source', 'unknown')}`\n"
+                f"- **Shape**: `{_mat.shape if isinstance(_mat, np.ndarray) else 'invalid'}`\n"
+                f"- **Created at**: `{_c.get('created_at', 'unknown')}`\n"
+            )
+            _cur_fp = _fingerprint_merchants(
+                st.session_state.merchants_df.reset_index(drop=True)
+            )
+            if _c.get("fingerprint") == _cur_fp:
+                st.success("✅ Matches current merchant set — cache will be reused.")
+            else:
+                st.warning("⚠️ Does not match current merchant set — will be invalidated on next solve.")
 
-    map_data = st.session_state.merchants_df.copy()
+    # ---------- Static network map with rich hover ----------
+    st.markdown("### 📍 Lagos Corridor Network Map")
+    st.caption(
+        "**Hover a merchant marker** to see its name, coordinates, and demand. "
+        "**Hover anywhere else** on the map to read lat/lon."
+    )
+
+    map_data = _augment_for_tooltip(st.session_state.merchants_df)
     map_data['color'] = map_data['type'].apply(
         lambda t: [255, 69, 0, 200] if t == 'Depot' else [30, 144, 255, 180]
     )
@@ -905,7 +1139,18 @@ if app_mode == "Overview & Fleet Routes":
         pickable=True,
         auto_highlight=True,
     )
+
     hover_layer = build_hover_layer(st.session_state.merchants_df)
+
+    # Tooltip fields exist on BOTH layers so nothing renders as {undefined}.
+    shared_tooltip = {
+        "html": (
+            "<b>{display_name}</b>"
+            "<div>Lat: {lat_str}<br/>Lon: {lon_str}</div>"
+            "<div>Demand: {demand_str} cartons</div>"
+        ),
+        "style": {"backgroundColor": "steelblue", "color": "white"},
+    }
 
     view_state = pdk.ViewState(
         latitude=float(map_data['lat'].mean()),
@@ -914,13 +1159,11 @@ if app_mode == "Overview & Fleet Routes":
         pitch=30,
     )
 
+    # Hover grid FIRST (bottom), merchants SECOND (top) so merchants win the pick.
     static_deck = pdk.Deck(
-        layers=[merchant_layer, hover_layer],
+        layers=[hover_layer, merchant_layer],
         initial_view_state=view_state,
-        tooltip={
-            "html": "<b>Lat:</b> {lat_str}<br/><b>Lon:</b> {lon_str}",
-            "style": {"backgroundColor": "steelblue", "color": "white"}
-        },
+        tooltip=shared_tooltip,
         map_style=None,
     )
     st.pydeck_chart(static_deck, use_container_width=True)
@@ -950,13 +1193,6 @@ if app_mode == "Overview & Fleet Routes":
                 st.session_state.fleet_df['Status'] == 'Active'
             ].reset_index(drop=True)
 
-            depot_rows = nodes[nodes['type'] == 'Depot']
-            depot_pt = (
-                (float(depot_rows.iloc[0]['lat']), float(depot_rows.iloc[0]['lon']))
-                if not depot_rows.empty
-                else (float(nodes.iloc[0]['lat']), float(nodes.iloc[0]['lon']))
-            )
-
             palette = [
                 [0, 255, 127, 220],
                 [255, 165, 0, 220],
@@ -967,7 +1203,7 @@ if app_mode == "Overview & Fleet Routes":
             ]
             van_colors = [palette[i % len(palette)] for i in range(len(van_paths))]
 
-            bg_data = nodes.copy()
+            bg_data = _augment_for_tooltip(nodes)
             bg_data['color'] = bg_data['type'].apply(
                 lambda t: [255, 69, 0, 200] if t == 'Depot' else [30, 144, 255, 160]
             )
@@ -1038,6 +1274,15 @@ if app_mode == "Overview & Fleet Routes":
                             if v_idx < len(active_fleet)
                             else f"Van {v_idx+1}"
                         ) + f" → {target_name}",
+                        # Dummy fields so the shared tooltip resolves on van points too
+                        "lat_str": f"{pt[0]:.5f}",
+                        "lon_str": f"{pt[1]:.5f}",
+                        "display_name": (
+                            active_fleet.loc[v_idx, "Van ID"]
+                            if v_idx < len(active_fleet)
+                            else f"Van {v_idx+1}"
+                        ),
+                        "demand_str": "",
                     })
 
                 if not anim_rows:
@@ -1055,11 +1300,11 @@ if app_mode == "Overview & Fleet Routes":
 
                 anim_hover = build_hover_layer(nodes)
 
-                layers = [bg_layer]
+                # Order: hover grid (bottom) → merchants → paths → vans (top)
+                layers = [anim_hover, bg_layer]
                 if show_paths and path_records:
                     layers.append(path_layer)
                 layers.append(van_layer)
-                layers.append(anim_hover)
 
                 anim_deck = pdk.Deck(
                     layers=layers,
@@ -1070,8 +1315,12 @@ if app_mode == "Overview & Fleet Routes":
                         pitch=30,
                     ),
                     tooltip={
-                        "html": "<b>{van_name}</b><br/>Lat: {lat}<br/>Lon: {lon}",
-                        "style": {"backgroundColor": "black", "color": "white"}
+                        "html": (
+                            "<b>{display_name}</b>"
+                            "<div>Lat: {lat_str}<br/>Lon: {lon_str}</div>"
+                            "<div>Demand: {demand_str} cartons</div>"
+                        ),
+                        "style": {"backgroundColor": "black", "color": "white"},
                     },
                     map_style=None,
                 )
@@ -1110,6 +1359,10 @@ elif app_mode == "Operational Simulation (SimPy)":
 
     nodes = st.session_state.vrp_nodes
     vrp_routes = st.session_state.vrp_routes
+    dist_matrix_m = st.session_state.get("_dist_matrix_m")
+    dist_source = st.session_state.get("_vrp_distance_source", "unknown")
+
+    st.caption(f"Travel legs use the same matrix as the solver: **{dist_source}**.")
 
     with st.expander("⚙️ Simulation & Cost Parameters", expanded=False):
         c1, c2, c3 = st.columns(3)
@@ -1147,10 +1400,16 @@ elif app_mode == "Operational Simulation (SimPy)":
 
     if run_single:
         with st.spinner("Simulating optimized plan..."):
-            opt = simulate_routes(vrp_routes, nodes, st.session_state.fleet_df, cfg, seed=42)
+            opt = simulate_routes(
+                vrp_routes, nodes, st.session_state.fleet_df, cfg,
+                seed=42, dist_matrix_m=dist_matrix_m,
+            )
         with st.spinner("Simulating round-robin baseline..."):
             baseline_routes = _assign_round_robin(nodes, st.session_state.fleet_df)
-            base = simulate_routes(baseline_routes, nodes, st.session_state.fleet_df, cfg, seed=42)
+            base = simulate_routes(
+                baseline_routes, nodes, st.session_state.fleet_df, cfg,
+                seed=42, dist_matrix_m=dist_matrix_m,
+            )
 
         o, b = opt["totals"], base["totals"]
 
@@ -1252,7 +1511,8 @@ elif app_mode == "Operational Simulation (SimPy)":
         )
         with st.spinner(f"Running 50 Monte-Carlo iterations on {plan_label}..."):
             mc_summary, mc_df = monte_carlo_simulation(
-                routes_to_use, nodes, st.session_state.fleet_df, cfg, n_runs=50
+                routes_to_use, nodes, st.session_state.fleet_df, cfg,
+                n_runs=50, dist_matrix_m=dist_matrix_m,
             )
 
         st.markdown(f"### 🎲 Monte Carlo Distribution — {plan_label}")
